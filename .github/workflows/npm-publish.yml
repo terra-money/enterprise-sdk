@@ -4,6 +4,13 @@ on:
   push:
     branches:
       - main
+  workflow_dispatch:
+    inputs:
+      run_build:
+        description: 'Run build'
+        required: false
+        default: false
+        type: boolean
 
 jobs:
   publish:
