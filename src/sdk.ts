@@ -1,13 +1,31 @@
 import { enterprise_factory, enterprise } from 'types/contracts';
-import { NetworkInfo, useWallet, useConnectedWallet } from '@terra-money/wallet-provider';
-import { contractQuery, LUNA } from 'utils';
-import { TxInfo } from '@terra-money/terra.js';
-import { TxBuilder } from 'tx';
+import { NetworkInfo, useWallet, useConnectedWallet, useLCDClient } from '@terra-money/wallet-provider';
+import { contractQuery } from 'utils';
+import { getNetworkOrLCD } from '@terra-money/apps/queries';
+import { LCDClient } from '@terra-money/terra.js';
 import { WalletLike, Wallet, wallet } from './wallet';
-import Big from 'big.js';
-import { useQuery, UseQueryResult } from 'react-query';
-import { QUERY_KEY } from './queryKey';
+import Big, { BigSource } from 'big.js';
+import { useQuery, UseQueryResult, UseQueryOptions } from 'react-query';
+import { u } from '@terra-money/apps/types';
+import { DAOSocials, DAOGovernanceConfig, DAO } from 'types';
+import { MultisigMember } from 'types/MultisigMember';
+import { toProposal } from 'utils/toProposal';
+import { assertDefined } from 'utils/assertDefined';
+import { Proposal } from 'types/proposal';
+import { ApiEndpoints, useApiEndpoint } from 'utils/hooks/useApiEndpoint';
+import { QUERY_KEY } from 'types/queryKey';
+import { useContract } from 'utils/hooks/useContract';
+import { useContractAddress } from 'utils/hooks/useContractAddress';
+import { compareAddress } from 'utils/compareAddress';
 
+export interface UseProposalVotesQueryOptions {
+  contract: CW20Addr;
+  proposalId: number;
+  limit?: number;
+}
+export type NominalType<T extends BigSource> = { __type: T };
+export type CW20Addr = string & NominalType<'CW20Addr'>;
+export type Frequency = 'week' | 'day' | 'hour' | 'minute';
 export type ProposalsQueryArguments = Extract<enterprise.QueryMsg, { proposals: {} }>;
 export type CouncilProposalsQueryArguments = Extract<enterprise.QueryMsg, { council_proposals: {} }>;
 export type DAOsQueryResponse = Array<{
@@ -26,6 +44,31 @@ export type Variables = {
   collectionAddr: string;
   tokenId: string;
 };
+export type TokenIds = string[];
+export type Direction = 'asc' | 'desc';
+export interface DAOsQueryOptions {
+  query?: string;
+  limit?: number;
+  direction?: Direction;
+  queryKey?: QUERY_KEY;
+}
+export interface UseDAOProposalsQueryOptions {
+  address: string;
+  direction?: Direction;
+  enabled?: boolean;
+}
+export interface UseProposalQueryOptions {
+  daoAddress: CW20Addr;
+  id: number;
+  enabled?: boolean;
+}
+export interface UseProposalsQueryOptions {
+  daoAddress?: string;
+  limit?: number;
+  direction?: Direction;
+  enabled?: boolean;
+  queryKey?: QUERY_KEY;
+}
 export enum TX_KEY {
   CREATE_DAO = 'TX:CREATE_DAO',
   STAKE_TOKEN = 'TX:STAKE_TOKEN',
@@ -38,6 +81,25 @@ export enum TX_KEY {
   CAST_VOTE = 'TX:CAST_VOTE',
   DEPOSIT = 'TX:DEPOSIT',
 }
+export interface QueryRefetch {
+  queryKey: QUERY_KEY;
+  wait?: number;
+}
+export type ProposalsQueryResponse = Array<{
+  daoAddress: string;
+  id: number;
+  created: number;
+  title: string;
+  description: string;
+  expires: enterprise.Expiration;
+  status: enterprise.ProposalStatus;
+  proposalActions: enterprise.ProposalAction[];
+  yesVotes: string;
+  noVotes: string;
+  abstainVotes: string;
+  vetoVotes: string;
+  totalVotes: string;
+}>;
 export type QueryRefetchMap = Record<TX_KEY, (QUERY_KEY | QueryRefetch)[]>;
 export const QUERY_REFETCH_MAP: QueryRefetchMap = {
   [TX_KEY.CREATE_DAO]: [QUERY_KEY.DAOS, QUERY_KEY.RECENT_DAOS],
@@ -157,7 +219,7 @@ export class EnterpriseSdk {
     return useQuery(
       [QUERY_KEY.BLOCK_HEIGHT, network.lcd],
       () => {
-        return fetchBlockHeight(network);
+        return this.fetchBlockHeight(network);
       },
       {
         refetchOnMount: true,
@@ -286,9 +348,9 @@ export class EnterpriseSdk {
   public async useDaoProposalsQuery({
     address,
     enabled = true,
-  }: UseProposalsQueryOptions): UseQueryResult<Array<Proposal> | undefined> {
+  }: UseDAOProposalsQueryOptions): UseQueryResult<Array<Proposal> | undefined> {
     const { query } = useContract();
-    const { data: dao } = useDAOQuery(address as CW20Addr);
+    const { data: dao } = this.useDAOQuery(address as CW20Addr);
 
     return useQuery(
       [QUERY_KEY.PROPOSALS, address],
@@ -298,7 +360,7 @@ export class EnterpriseSdk {
           const { proposals } = await query<ProposalsQueryArguments, enterprise.ProposalsResponse>(address, {
             proposals: {},
           });
-          result.push(...proposals.map((resp) => toProposal(resp, assertDefined(dao), 'regular')));
+          result.push(...proposals.map((resp) => toProposal(resp, assertDefined(dao), 'general')));
         } catch (err) {
           reportError(err);
         }
@@ -464,6 +526,26 @@ export class EnterpriseSdk {
     );
   }
 
+  public async fetchNativeBalance(
+    networkOrLCD: NetworkInfo | LCDClient,
+    walletAddr: string,
+    denom: string
+  ): Promise<u<Big>> {
+    const lcd =
+      networkOrLCD instanceof LCDClient
+        ? networkOrLCD
+        : new LCDClient({
+            URL: networkOrLCD.lcd,
+            chainID: networkOrLCD.chainID,
+          });
+
+    const [coins] = await lcd.bank.balance(walletAddr);
+
+    const coin = coins.get(denom);
+
+    return Big(coin === undefined ? 0 : coin.amount.toNumber()) as u<Big>;
+  }
+
   public async useNativeBalanceQuery(): UseQueryResult<u<Big> | undefined> {
     const connectedWallet = useConnectedWallet();
 
@@ -477,7 +559,7 @@ export class EnterpriseSdk {
     );
   }
 
-  createCollectionQuery = (vars: Variables) => {
+  public createCollectionQuery = (vars: Variables) => {
     return `
     query MyQuery {
       tokensPage(collectionAddr:"${vars.collectionAddr}", tokenId: "${vars.tokenId}") {
@@ -521,7 +603,7 @@ export class EnterpriseSdk {
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        query: createCollectionQuery(variables),
+        query: this.createCollectionQuery(variables),
       }),
     });
 
@@ -559,7 +641,7 @@ export class EnterpriseSdk {
 
     return useQuery(
       [QUERY_KEY.NFT_STAKING_AMOUNT, daoAddress, walletAddress],
-      () => fetchStakingAmount(network, daoAddress as CW20Addr, walletAddress as CW20Addr),
+      () => this.fetchStakingAmount(network, daoAddress as CW20Addr, walletAddress as CW20Addr),
       {
         refetchOnMount: false,
         ...options,
@@ -602,7 +684,7 @@ export class EnterpriseSdk {
 
     const { id, daoAddress, enabled = true } = options;
 
-    const { data: dao } = useDAOQuery(daoAddress as CW20Addr);
+    const { data: dao } = this.useDAOQuery(daoAddress as CW20Addr);
 
     return useQuery(
       [QUERY_KEY.PROPOSAL, daoAddress, id],
@@ -611,7 +693,7 @@ export class EnterpriseSdk {
           let resp = await query<ProposalsQueryArguments, enterprise.ProposalResponse>(daoAddress, {
             proposal: { proposal_id: id },
           });
-          return toProposal(resp, assertDefined(dao), 'regular');
+          return toProposal(resp, assertDefined(dao), 'general');
         } catch (err) {
           const councilProposal = await query<CouncilProposalsQueryArguments, enterprise.ProposalResponse>(daoAddress, {
             council_proposal: { proposal_id: id },
@@ -681,7 +763,7 @@ export class EnterpriseSdk {
                 abstainVotes: Big(entity.abstainVotes),
                 vetoVotes: Big(entity.vetoVotes ?? '0'),
                 totalVotes: Big(entity.totalVotes ?? '0'),
-                votingType: 'regular',
+                votingType: 'general',
               });
             }
           });
@@ -726,43 +808,6 @@ export class EnterpriseSdk {
     );
   }
 
-  public async useProposalVotesQuery(options: UseProposalVotesQueryOptions) {
-    const { contract, proposalId, limit = 10 } = options;
-    const { network } = useWallet();
-
-    return useInfiniteQuery(
-      [QUERY_KEY.PROPOSAL_VOTES, contract, proposalId],
-      async ({ pageParam }) => {
-        if (pageParam === null) {
-          return;
-        }
-
-        const { votes } = await contractQuery<enterprise.QueryMsg, enterprise.PollVotersResponse>(network, contract, {
-          proposal_votes: {
-            proposal_id: proposalId,
-            start_after: pageParam,
-            limit,
-          },
-        });
-
-        return {
-          votes: votes.filter((p) => p.poll_id === proposalId).map((vote) => new Vote(vote)),
-        };
-      },
-      {
-        refetchOnMount: false,
-        getNextPageParam: (lastPage) => {
-          if (lastPage === undefined || lastPage.votes?.length < limit) {
-            return null;
-          }
-
-          const lastVote = getLast(lastPage.votes);
-          return lastVote.voter || null;
-        },
-      }
-    );
-  }
-
   public async fetchReleasableClaims(
     networkOrLCD: NetworkInfo | LCDClient,
     daoAddress: CW20Addr,
@@ -793,25 +838,6 @@ export class EnterpriseSdk {
     );
   };
 
-  public useTokenBalanceQuery(
-    walletAddr: string,
-    token: Token,
-    options: Partial<Pick<UseQueryOptions, 'enabled'>> = { enabled: true }
-  ): UseQueryResult<u<Big>> {
-    const { network } = useWallet();
-
-    return useQuery(
-      [QUERY_KEY.TOKEN_BALANCE, network, token.key, walletAddr],
-      () => {
-        return fetchTokenBalance(network, token, walletAddr);
-      },
-      {
-        refetchOnMount: false,
-        ...options,
-      }
-    );
-  }
-
   public useTokenStakingAmountQuery(
     daoAddress: string,
     walletAddress?: string,
@@ -828,80 +854,6 @@ export class EnterpriseSdk {
       }
     );
   }
-
-  public useTreasuryTokensQuery(address: string) {
-    const { data: assets } = useDAOAssetTreasury(address);
-    const { tokens } = useTokens();
-    const { data: prices } = usePricesQuery();
-
-    const { network } = useWallet();
-
-    return useQuery(
-      [QUERY_KEY.TREASURY_TOKENS, address],
-      async () => {
-        const result = [] as TreasuryToken[];
-        await Promise.all(
-          assertDefined(assets).map(async (asset) => {
-            const tokenKey = getAssetKey(asset.info);
-            let token = tokens[tokenKey];
-            if (!token && getAssetType(asset.info) === 'cw20') {
-              try {
-                const tokenInfo = await fetchCW20TokenInfo(network, tokenKey);
-
-                token = {
-                  ...tokenInfo,
-                  type: 'cw20',
-                  key: tokenKey,
-                  token: tokenKey as CW20Addr,
-                  icon: '',
-                  protocol: '',
-                };
-              } catch {
-                console.log(`Failed to fetch token info for ${tokenKey}`);
-              }
-            }
-
-            const amount = Big(asset.amount);
-            if (token && amount.gt(0)) {
-              const price = assertDefined(prices)[tokenKey];
-              result.push({
-                ...token,
-                amount: asset.amount as u<BigSource>,
-                usdAmount: price ? demicrofy(amount as u<BigSource>, token.decimals).mul(price) : undefined,
-              });
-            }
-          })
-        );
-
-        return result;
-      },
-      {
-        enabled: !!(assets && tokens && prices),
-      }
-    );
-  }
-
-  public async fetchTxs(network: NetworkInfo, address: CW20Addr, offset: number, limit: number): Promise<any> {
-    const response = await fetch(`${network.api}/txs?offset=${offset}&limit=${limit}&account=${address}`);
-
-    const json = await response.json();
-
-    return json.txs as TxResponse[];
-  }
-
-  public useTxsQuery = (address: CW20Addr, offset: number = 0, limit: number = 10): UseQueryResult<TxResponse[]> => {
-    const { network } = useWallet();
-
-    return useQuery(
-      [QUERY_KEY.TXS, network.lcd],
-      () => {
-        return this.fetchTxs(network, address, offset, limit);
-      },
-      {
-        refetchOnMount: true,
-      }
-    );
-  };
 
   public async fetchVotingPower(
     networkOrLCD: NetworkInfo | LCDClient,
